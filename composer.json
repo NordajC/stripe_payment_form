@@ -1,0 +1,8 @@
+{
+  "name": "your-name/custom-stripe-course-payment-form",
+  "description": "Custom Stripe Payment Form for Courses",
+  "require": {
+      "stripe/stripe-php": "^7.0",
+    "vlucas/phpdotenv": "^5.6"
+  }
+}
