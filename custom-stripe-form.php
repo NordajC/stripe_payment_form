@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Custom Stripe Course Payment Form
  * Plugin URI:  https://yourwebsite.com
- * Description: A simple plugin to handle Stripe payments for courses/lessons. [custom_stripe_course_form]
+ * Description: A simple plugin to handle Stripe payments for courses/lessons. [custom_stripe_course_form]. Requires WP mail SMTP plugin and setup for email there.
  * Version: 1.0
  * Author: Jordan Chong
  * Author URI: https://yourwebsite.com
@@ -72,6 +72,30 @@ function csf_payment_form() {
 }
 add_shortcode('custom_stripe_course_form', 'csf_payment_form');
 
+// Send a confirmation email to the user
+function send_user_confirmation_email($user_email, $course_name) {
+    $subject = "Booking Confirmation for " . $course_name;
+    $message = "Dear Customer,\n\n";
+    $message .= "Thank you for booking the " . $course_name . " course with us.\n\n";
+    $message .= "Your booking is confirmed. We will get in touch with you shortly.\n\n";
+    $message .= "Kind regards,\nYour Course Team";
+
+    wp_mail($user_email, $subject, $message);
+}
+
+// Send a notification email to the admin
+function send_admin_notification($user_email, $course_name, $user_name) {
+    $admin_email = 'youremail@example.com';  // Replace with your email address
+    $subject = "New Course Booking: " . $course_name;
+    $message = "A new booking has been made for the " . $course_name . " course.\n\n";
+    $message .= "Customer Name: " . $user_name . "\n";
+    $message .= "Customer Email: " . $user_email . "\n";
+    $message .= "Course: " . $course_name . "\n";
+    $message .= "Please process the booking accordingly.";
+
+    wp_mail($admin_email, $subject, $message);
+}
+
 // Handle Stripe Checkout Session
 function csf_create_checkout_session() {
     require_once __DIR__ . '/vendor/autoload.php';
@@ -96,6 +120,7 @@ function csf_create_checkout_session() {
     $course_price = 32000;
 
     try {
+        // Create the Stripe session
         $session = \Stripe\Checkout\Session::create([
             'payment_method_types' => ['card'],
             'line_items' => [[
@@ -119,6 +144,12 @@ function csf_create_checkout_session() {
         // Log session ID for debugging
         error_log("Stripe session created successfully: " . $session->id);
     
+        // Send confirmation email to the user
+        send_user_confirmation_email($data['email'], $course_name);
+    
+        // Send notification email to the admin
+        send_admin_notification($data['email'], $course_name, $data['name']);
+    
         // Return session ID to the front end
         wp_send_json_success(["id" => $session->id]);
     } catch (Exception $e) {
@@ -126,7 +157,6 @@ function csf_create_checkout_session() {
         wp_send_json_error(["message" => "Stripe session creation failed", "error" => $e->getMessage()], 500);
     }
     
-
     wp_die();
 }
 add_action('wp_ajax_csf_create_checkout_session', 'csf_create_checkout_session');
