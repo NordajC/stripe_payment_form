@@ -3,7 +3,7 @@
  * Plugin Name: Custom Stripe Course Payment Form
  * Plugin URI:  https://yourwebsite.com
  * Description: A simple plugin to handle Stripe payments for courses/lessons. [custom_stripe_course_form]. Requires WP mail SMTP plugin and setup for email there.
- * Version: 1.2
+ * Version: 1.5
  * Author: Jordan Chong
  * Author URI: https://yourwebsite.com
  */
@@ -22,6 +22,10 @@ if (file_exists(__DIR__ . '/.env')) {
 // Get the keys from the .env file
 $stripe_secret_key = getenv('STRIPE_SECRET_KEY') ?: $_ENV['STRIPE_SECRET_KEY'] ?? '';
 $stripe_publishable_key = getenv('STRIPE_PUBLISHABLE_KEY') ?: $_ENV['STRIPE_PUBLISHABLE_KEY'] ?? '';
+$stripe_webhook_secret = getenv('STRIPE_WEBHOOK_SECRET') ?: $_ENV['STRIPE_WEBHOOK_SECRET'] ?? '';
+
+// Ensure this is set in your .env file:
+// STRIPE_WEBHOOK_SECRET=whsec_your_webhook_secret_here
 
 // Prevent Stripe from running if the key is missing
 if (empty($stripe_secret_key)) {
@@ -29,48 +33,150 @@ if (empty($stripe_secret_key)) {
     return;
 }
 
-error_log("Plugin is active and running.");
+// Add this near the top of your plugin file
+function csf_register_webhook_endpoint() {
+    add_rewrite_rule('^stripe-webhook/?$', 'index.php?stripe_webhook=1', 'top');
+    add_rewrite_tag('%stripe_webhook%', '([^&]+)');
+    flush_rewrite_rules();
+}
+add_action('init', 'csf_register_webhook_endpoint');
+
+function csf_parse_request($wp) {
+    if (array_key_exists('stripe_webhook', $wp->query_vars)) {
+        csf_handle_webhook();
+        exit;
+    }
+    return $wp;
+}
+add_action('parse_request', 'csf_parse_request');
+
+function csf_handle_webhook() {
+    require_once __DIR__ . '/vendor/autoload.php';
+    
+    global $stripe_secret_key;
+    \Stripe\Stripe::setApiKey($stripe_secret_key);
+    
+    // Ensure raw access to the request body for signature verification
+    $endpoint_secret = getenv('STRIPE_WEBHOOK_SECRET') ?: $_ENV['STRIPE_WEBHOOK_SECRET'] ?? '';
+    if (empty($endpoint_secret)) {
+        error_log("Webhook Error: No endpoint secret found");
+        http_response_code(500);
+        echo json_encode(['error' => 'Configuration error']);
+        exit;
+    }
+    
+    remove_filter('wp_get_raw_request_body', 'wp_magic_quotes');
+
+    $payload = @file_get_contents('php://input');
+    if (empty($payload)) {
+        // Alternative method if standard approach fails
+        $input = fopen('php://input', 'r');
+        $payload = stream_get_contents($input);
+        fclose($input);
+    }
+    
+    if (empty($payload)) {
+        error_log("Webhook Error: Could not read payload");
+        http_response_code(400);
+        echo json_encode(['error' => 'Cannot read payload']);
+        exit;
+    }
+    error_log("Raw Webhook Payload: " . $payload);
+    
+    // More robust header detection
+    $sig_header = '';
+    if (isset($_SERVER['HTTP_STRIPE_SIGNATURE'])) {
+        $sig_header = $_SERVER['HTTP_STRIPE_SIGNATURE'];
+    } else {
+        // Try multiple methods to get headers
+        if (function_exists('getallheaders')) {
+            $headers = getallheaders();
+        } else {
+            // Manual header extraction for servers without getallheaders()
+            $headers = [];
+            foreach ($_SERVER as $name => $value) {
+                if (substr($name, 0, 5) === 'HTTP_') {
+                    $headers[str_replace(' ', '-', ucwords(strtolower(str_replace('_', ' ', substr($name, 5)))))] = $value;
+                }
+            }
+        }
+        
+        // Try different header case variations
+        $sig_header = $headers['Stripe-Signature'] ?? 
+                    $headers['stripe-signature'] ?? 
+                    $headers['STRIPE-SIGNATURE'] ?? '';
+    }
+
+    if (empty($sig_header)) {
+        error_log("Webhook Error: No Stripe signature header found");
+        http_response_code(400);
+        echo json_encode(['error' => 'Missing signature header']);
+        exit;
+    }
+    
+    try {
+        error_log("Using webhook secret: " . substr($endpoint_secret, 0, 10) . '...');
+        
+        $event = \Stripe\Webhook::constructEvent(
+            $payload, $sig_header, $endpoint_secret
+        );
+        
+        switch ($event->type) {
+            case 'checkout.session.completed':
+                $session = $event->data->object;
+                csf_handle_successful_payment($session);
+                break;
+            case 'payment_intent.payment_failed':
+                $intent = $event->data->object;
+                csf_handle_failed_payment($intent);
+                break;
+        }
+        
+        http_response_code(200);
+        echo json_encode(['status' => 'success']);
+        exit;
+        
+    } catch(\UnexpectedValueException $e) {
+        error_log("Webhook Error: " . $e->getMessage());
+        http_response_code(400);
+        echo json_encode(['error' => $e->getMessage()]);
+        exit;
+    } catch(\Stripe\Exception\SignatureVerificationException $e) {
+        error_log("Webhook Signature Error: " . $e->getMessage());
+        http_response_code(400);
+        echo json_encode(['error' => 'Invalid signature']);
+        exit;
+    }
+}
+
 
 // Set Stripe API key for backend (Secret Key)
 \Stripe\Stripe::setApiKey($stripe_secret_key);
 
 function csf_enqueue_scripts() {
-    // ✅ Ensure Stripe is loaded first
+    // Ensure Stripe is loaded first
     wp_enqueue_script('stripe-js', 'https://js.stripe.com/v3/', [], null, true);
     
-    // ✅ Ensure your script loads AFTER Stripe.js
+    // Ensure your script loads AFTER Stripe.js
     wp_enqueue_script('csf-script', plugin_dir_url(__FILE__) . 'src/script.js', ['jquery', 'stripe-js'], null, true);
     
-    // ✅ Ensure styles load
+    // Ensure styles load
     wp_enqueue_style('csf-style', plugin_dir_url(__FILE__) . 'src/style.css');
 
-    // ✅ Get Stripe Publishable Key
+    // Get Stripe Publishable Key
     $stripe_publishable_key = $_ENV['STRIPE_PUBLISHABLE_KEY'] ?? '';
 
-    // ✅ Debugging: Log if key is missing
-    error_log("Stripe Publishable Key: " . ($stripe_publishable_key ?: 'MISSING'));
+    $nonce = wp_create_nonce('csf_checkout_nonce');  // Ensure nonce is defined
 
-    // ✅ Pass data to JavaScript
+    // Pass data to JavaScript
     wp_localize_script('csf-script', 'csf_vars', [
         'stripePublicKey' => $stripe_publishable_key,
-        'nonce' => wp_create_nonce('csf_checkout_nonce'),
+        'nonce' => $nonce,
         'ajaxurl' => admin_url('admin-ajax.php')
     ]);
 }
 add_action('wp_enqueue_scripts', 'csf_enqueue_scripts', 999); // ✅ Ensure it loads LAST
 
-add_action('wp_ajax_nopriv_test_ajax', function() {
-    wp_send_json_success(['message' => 'AJAX is working']);
-});
-add_action('wp_ajax_test_ajax', function() {
-    wp_send_json_success(['message' => 'AJAX is working']);
-});
-
-// Add this right after your wp_localize_script call
-error_log("Localizing script with: " . json_encode([
-    'stripePublicKey' => $stripe_publishable_key ? 'YES' : 'NO',
-    'nonce' => $nonce ? 'YES' : 'NO'
-]));
 
 // Shortcode to display the form
 function csf_payment_form() {
@@ -379,7 +485,7 @@ function csf_payment_form() {
 
         <h3>Emergency Contact</h3>
         <label for="emergencyName">Emergency Name</label>
-        <input type="text" id="emergencyName" name="emergencyMame" required>
+        <input type="text" id="emergencyName" name="emergencyName" required>
 
         <label for="relationship">Relationship</label>
         <input type="text" id="relationship" name="relationship" required>
@@ -394,18 +500,11 @@ function csf_payment_form() {
         </select>
 
         <h3>Privacy and Terms</h3>
-        <!-- <label for="privacy">
-            I understand that Golders Green College will securely store my personal information and I allow them to send me important information.
-        </label><input type="checkbox" name="privacy" id="privacy" required>
-
-        <label for="terms">
-            <input type="checkbox" name="terms" id="terms" required>I acknowledge that I have read and understood the College Terms and Conditions as provided, and I agree to all of the terms.
-        </label> -->
 
         <div class="checkbox-container">
             <input class="checkbox" type="checkbox" name="privacy" id="privacy" required>
             <label for="privacy">
-                I understand that Golders Green College will securely store my personal information and I allow them to send me important information.
+                I understand that GG Colleges will securely store my personal information and I allow them to send me important information.
             </label>
         </div>
 
@@ -423,21 +522,95 @@ function csf_payment_form() {
 }
 add_shortcode('custom_stripe_course_form', 'csf_payment_form');
 
+function csf_handle_successful_payment($session) {
+    // Get customer data from session metadata
+    $customer_email = $customer_email = $session->customer_details->email ?? $session->metadata->email ?? '';
+    $customer_name = $session->metadata->name;
+    $course_name = $session->metadata->course_name;
+    $phone = $session->metadata->phone;
+    
+    // Create invoice in Stripe
+    try {
+        global $stripe_secret_key;
+        \Stripe\Stripe::setApiKey($stripe_secret_key);
+        
+        // Get the payment intent to access payment details
+        $payment_intent = \Stripe\PaymentIntent::retrieve($session->payment_intent);
+        
+        // Create an invoice item
+        $invoice_item = \Stripe\InvoiceItem::create([
+            'customer' => $session->customer,
+            'amount' => $session->amount_total,
+            'currency' => 'gbp',
+            'description' => "Payment for $course_name",
+        ]);
+        
+        // Create and finalize the invoice
+        $invoice = \Stripe\Invoice::create([
+            'customer' => $session->customer,
+            'auto_advance' => true,
+        ]);
+        
+        $invoice->finalizeInvoice();
+        
+        // Send invoice to customer
+        $invoice_pdf_url = $invoice->invoice_pdf;
+        
+        // Send email with invoice
+        send_payment_confirmation_email($customer_email, $customer_name, $course_name, $invoice->number, $invoice_pdf_url, $session->amount_total);
+        
+        // Notify admin about successful payment
+        send_payment_notification_to_admin($customer_email, $customer_name, $phone, $course_name, $invoice->number, $session->amount_total, 'successful');
+        
+    } catch (Exception $e) {
+        error_log("Error creating invoice: " . $e->getMessage());
+        
+        // Even if invoice creation fails, send basic confirmation emails
+        // send_payment_confirmation_email($customer_email, $customer_name, $course_name, 'N/A', null, $session->amount_total);
+        send_payment_notification_to_admin($customer_email, $customer_name, $phone, $course_name, 'N/A', $session->amount_total, 'successful');
+    }
+}
+
+function csf_handle_failed_payment($payment_intent) {
+    // Get customer information from payment intent
+    $customer_email = $payment_intent->metadata->email ?? '';
+    $customer_name = $payment_intent->metadata->name ?? '';
+    $course_name = $payment_intent->metadata->course_name ?? '';
+    $phone = $payment_intent->metadata->phone ?? '';
+    
+    // Notify admin about failed payment
+    if (!empty($customer_email)) {
+        send_payment_notification_to_admin($customer_email, $customer_name, $phone, $course_name, 'N/A', $payment_intent->amount, 'failed');
+    }
+}
+
 function csf_create_checkout_session() {
     require_once __DIR__ . '/vendor/autoload.php';
 
     global $stripe_secret_key;
 
+    // Read the input once
     $input = file_get_contents('php://input');
-    error_log('Received data: ' . $input);
+    $data = json_decode($input, true);
+
+        // Check nonce for security
+    if (!isset($_SERVER['HTTP_X_WP_NONCE']) || !wp_verify_nonce($_SERVER['HTTP_X_WP_NONCE'], 'csf_checkout_nonce')) {
+        wp_send_json_error(["message" => "Security check failed"], 403);
+        wp_die();
+    }
+
+    // Check if JSON decoding failed
+    if ($data === null) {
+        error_log("Error: Invalid JSON input");
+        wp_send_json_error(["message" => "Invalid request data"], 400);
+        wp_die();
+    }
 
     if (empty($stripe_secret_key)) {
         error_log("Stripe Secret Key is missing! Cannot process payment.");
         wp_send_json_error(["message" => "Stripe payment system error."], 500);
         wp_die();
     }
-
-    $data = json_decode(file_get_contents("php://input"), true);
 
     if (empty($data['course']) || empty($data['email']) || empty($data['name']) || empty($data['phone'])) {
         error_log("Error: Missing required fields");
@@ -461,25 +634,38 @@ function csf_create_checkout_session() {
     }
 
     $course_name = $course_names[$data['course']];
-    $course_price = 32000;
+    $course_price = 320;
 
     try {
+        // Create a customer first
+        $customer = \Stripe\Customer::create([
+            'email' => sanitize_email($data['email']),
+            'name' => sanitize_text_field($data['name']),
+            'phone' => sanitize_text_field($data['phone']),
+        ]);
+        
         $session = \Stripe\Checkout\Session::create([
             'payment_method_types' => ['card'],
+            'customer' => $customer->id,
             'line_items' => [[
                 'price_data' => [
                     'currency' => 'gbp',
                     'product_data' => ['name' => $course_name],
-                    'unit_amount' => $course_price,
+                    'unit_amount' => $course_price * 100, // Convert to cents
                 ],
                 'quantity' => 1,
             ]],
             'mode' => 'payment',
-            'customer_email' => sanitize_email($data['email']),
+            'invoice_creation' => [
+                'enabled' => true,
+            ],
+            // 'receipt_email' => sanitize_email($data['email']),
             'metadata' => [
                 'name' => sanitize_text_field($data['name']),
                 'phone' => sanitize_text_field($data['phone']),
-                'course_name' => $course_name
+                'course_name' => $course_name,
+                'email' => sanitize_email($data['email']),
+                // Add more metadata as needed
             ],
             'success_url' => site_url('/course-payment-success/'),
             'cancel_url' => site_url('/course-payment-cancel/'),
@@ -491,22 +677,22 @@ function csf_create_checkout_session() {
         }
 
         $user_data = [
-            'name' => $data['name'],
-            'email' => $data['email'],
-            'phone' => $data['phone'],
-            'course' => $course_name,
-            'courseDates' => $data['courseDates'],
-            'proficiency' => $data['proficiency'],
-            'streetAddress' => $data['streetAddress'],
-            'postalCode' => $data['postalCode'],
-            'city' => $data['city'],
-            'country' => $data['country'],
-            'emergencyName' => $data['emergencyName'],
-            'relationship' => $data['relationship'],
-            'emergencyPhone' => $data['emergencyPhone'],
-            'eng' => $data['eng'],
-            'privacy' => isset($data['privacy']) ? 'Yes' : 'No',
-            'terms' => isset($data['terms']) ? 'Yes' : 'No'
+            'name' => sanitize_text_field($data['name']),
+            'email' => sanitize_email($data['email']),
+            'phone' => sanitize_text_field($data['phone']),
+            'course' => sanitize_text_field($data['course']),
+            'courseDates' => sanitize_text_field($data['courseDates']),
+            'proficiency' => sanitize_text_field($data['proficiency']),
+            'streetAddress' => sanitize_textarea_field($data['streetAddress']), // Allows line breaks
+            'postalCode' => sanitize_text_field($data['postalCode']),
+            'city' => sanitize_text_field($data['city']),
+            'country' => sanitize_text_field($data['country']),
+            'emergencyName' => sanitize_text_field($data['emergencyName']),
+            'relationship' => sanitize_text_field($data['relationship']),
+            'emergencyPhone' => sanitize_text_field($data['emergencyPhone']),
+            'eng' => sanitize_text_field($data['eng']),
+            'privacy' => isset($data['privacy']) ? 'Yes' : 'No', // Already boolean-safe
+            'terms' => isset($data['terms']) ? 'Yes' : 'No',
         ];
 
         // send Confirmation Email to User
@@ -584,8 +770,8 @@ function send_user_confirmation_email($user_data) {
 
 
 function send_admin_notification($user_data) {
-    $admin_email = "it@globalvisasupport.com"; // Get WordPress admin email (ensure it's set in WordPress settings)
-    $subject = "New Course Booking: " . $user_data['course'];
+    $admin_email = "ggc.bookings@globalvisasupport.com"; // Get WordPress admin email (ensure it's set in WordPress settings)
+    $subject = "[pending] New Course Booking: " . $user_data['name'];
 
     $message = "A new course booking has been made. Here are the details:\n\n";
     $message .= "Full Name: " . $user_data['name'] . "\n";
@@ -629,4 +815,57 @@ function send_admin_notification($user_data) {
         }
     }
     
+}
+
+function send_payment_confirmation_email($customer_email, $customer_name, $course_name, $invoice_number, $invoice_pdf_url, $amount) {
+    $subject = "Payment Confirmation for $course_name";
+    
+    // Format amount properly (convert from cents to dollars/pounds)
+    $formatted_amount = number_format($amount / 100, 2);
+    
+    $message = "Dear $customer_name,\n\n";
+    $message .= "Thank you for your payment of £$formatted_amount for the $course_name.\n\n";
+    $message .= "Invoice Number: $invoice_number\n";
+    
+    if ($invoice_pdf_url) {
+        $message .= "You can view your invoice by clicking on the following link:\n";
+        $message .= "$invoice_pdf_url\n\n";
+    }
+    
+    $message .= "We're excited to have you join us for the course. If you have any questions, please contact us at info@ggcolleges.com.\n\n";
+    $message .= "Best regards,\nGG Colleges";
+    
+    $headers = "From: GG Colleges <no-reply@ggcolleges.com>\r\n";
+    
+    if (wp_mail($customer_email, $subject, $message, $headers)) {
+        error_log("Payment confirmation email sent to $customer_email");
+    } else {
+        error_log("Failed to send payment confirmation email to $customer_email");
+    }
+}
+
+function send_payment_notification_to_admin($customer_email, $customer_name, $phone, $course_name, $invoice_number, $amount, $status) {
+    $admin_email = "ggc.bookings@globalvisasupport.com";
+    $subject = "[$status] Course Payment: $customer_name";
+    
+    // Format amount properly
+    $formatted_amount = number_format($amount / 100, 2);
+    
+    $message = "A payment for $course_name has been $status.\n\n";
+    $message .= "Payment Details:\n";
+    $message .= "- Amount: £$formatted_amount\n";
+    $message .= "- Status: " . ucfirst($status) . "\n";
+    $message .= "- Invoice Number: $invoice_number\n\n";
+    $message .= "Customer Information:\n";
+    $message .= "- Name: $customer_name\n";
+    $message .= "- Email: $customer_email\n";
+    $message .= "- Phone: $phone\n";
+    
+    $headers = "From: GG Colleges <no-reply@ggcolleges.com>\r\n";
+    
+    if (wp_mail($admin_email, $subject, $message, $headers)) {
+        error_log("Payment notification email sent to admin");
+    } else {
+        error_log("Failed to send payment notification email to admin");
+    }
 }
